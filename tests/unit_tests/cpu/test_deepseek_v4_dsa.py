@@ -12,12 +12,16 @@ indices. These tests verify that the resulting attended (q, kv) pairs match
 the previous index-based formulation for every compression ratio.
 """
 
+import inspect
 import unittest
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.models.deepseek_v4.attention import DSV4FlexInnerAttention
+from torchtitan.models.deepseek_v4.attention import (
+    CompressedSparseAttention,
+    DSV4FlexInnerAttention,
+)
 from torchtitan.models.deepseek_v4.compressor import Indexer
 
 
@@ -92,6 +96,107 @@ def build_dsa(ratio, window_size, block_size=128):
 
 
 class TestDSABlockMask(unittest.TestCase):
+    def test_csa_gather_attention_reference_forward_and_backward(self):
+        torch.manual_seed(0)
+        seqlen, n_heads, head_dim = 16, 2, 8
+        ratio, index_topk = 4, 3
+        cfg = CompressedSparseAttention.Config(
+            block_size=8,
+            window_size=5,
+            compress_ratio=ratio,
+            softmax_scale=head_dim**-0.5,
+            index_topk=index_topk,
+        )
+        attention = CompressedSparseAttention(cfg)
+        inputs = [
+            torch.randn(seqlen, n_heads, head_dim, requires_grad=True),
+            torch.randn(seqlen, head_dim, requires_grad=True),
+            torch.randn(seqlen // ratio, head_dim, requires_grad=True),
+            torch.randn(seqlen, 3, 6, requires_grad=True),
+            torch.randn(seqlen // ratio, 6, requires_grad=True),
+            torch.randn(seqlen, 3, requires_grad=True),
+            torch.randn(n_heads, requires_grad=True),
+        ]
+
+        output = attention(*inputs)
+        self.assertEqual(output.shape, (seqlen, n_heads, head_dim))
+        self.assertTrue(torch.isfinite(output).all())
+        output.square().mean().backward()
+        for tensor in (*inputs[:3], inputs[-1]):
+            self.assertIsNotNone(tensor.grad)
+            self.assertTrue(torch.isfinite(tensor.grad).all())
+
+    def test_static_mask_does_not_capture_token_pair_tensor(self):
+        seqlen = 32768
+        dsa = build_dsa(ratio=128, window_size=2048, block_size=128)
+        block_mask = dsa.build_block_mask(seqlen=seqlen, device="cpu")
+
+        closure = inspect.getclosurevars(block_mask.mask_mod)
+        captured_tensors = [
+            value
+            for value in closure.nonlocals.values()
+            if isinstance(value, torch.Tensor)
+        ]
+        self.assertEqual(captured_tensors, [])
+
+        metadata = [
+            block_mask.kv_num_blocks,
+            block_mask.kv_indices,
+            block_mask.q_num_blocks,
+            block_mask.q_indices,
+        ]
+        metadata_bytes = sum(x.numel() * x.element_size() for x in metadata)
+        self.assertLess(metadata_bytes, 1024 * 1024)
+
+    def test_static_masks_match_index_formulation(self):
+        device = torch.device("cpu")
+        cases = [
+            (128, 17, 0, 32),
+            (128, 63, 1, (32, 16)),
+            (256, 64, 128, 32),
+            (512, 128, 128, (64, 32)),
+        ]
+        for seqlen, window_size, ratio, block_size in cases:
+            with self.subTest(
+                seqlen=seqlen,
+                window_size=window_size,
+                ratio=ratio,
+                block_size=block_size,
+            ):
+                n_cmp = seqlen // ratio if ratio > 1 else 0
+                sink_idx = seqlen + n_cmp
+                win = window_idxs(window_size, 1, seqlen, device)
+                compress = (
+                    compress_idxs(ratio, 1, seqlen, device, seqlen)
+                    if ratio > 1
+                    else torch.empty((1, seqlen, 0), dtype=torch.int64)
+                )
+                selected = (
+                    torch.cat([win, compress], dim=-1) if compress.size(-1) else win
+                )
+
+                dsa = build_dsa(ratio, window_size, block_size)
+                block_mask = dsa.build_block_mask(seqlen=seqlen, device=device)
+                expected = old_attended(selected, sink_idx)
+                actual = new_attended(block_mask, seqlen, n_cmp)
+                self.assertEqual(expected, actual)
+
+                bq, bk = (
+                    block_size
+                    if isinstance(block_size, tuple)
+                    else (block_size, block_size)
+                )
+                for q_block in range(seqlen // bq):
+                    q_slice = expected[q_block * bq : (q_block + 1) * bq]
+                    expected_blocks = {
+                        kv_idx // bk for attended in q_slice for kv_idx in attended
+                    }
+                    num_blocks = int(block_mask.kv_num_blocks[0, 0, q_block])
+                    actual_blocks = set(
+                        block_mask.kv_indices[0, 0, q_block, :num_blocks].tolist()
+                    )
+                    self.assertEqual(expected_blocks, actual_blocks)
+
     def test_attended_sets_match_old_formulation(self):
         torch.manual_seed(0)
         device = torch.device("cpu")
