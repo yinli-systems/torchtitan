@@ -20,6 +20,7 @@ requires CUDA for backward.
 """
 
 import unittest
+from unittest import mock
 
 import torch
 from torch.nn.attention.flex_attention import flex_attention
@@ -208,12 +209,12 @@ class TestCSASelectedAttentionMatchesBlockMask(unittest.TestCase):
                 a.grad, b.grad, atol=1e-3, rtol=1e-2, msg=f"grad[{name}] mismatch"
             )
 
-    def test_rejects_softmax_scale_mismatch(self):
+    def test_forwards_configured_softmax_scale(self):
         cfg = CompressedSparseAttention.Config(
             block_size=8,
             window_size=4,
             compress_ratio=4,
-            softmax_scale=0.1234,  # deliberately wrong vs. head_dim**-0.5
+            softmax_scale=0.1234,
             index_topk=2,
         )
         csa = CompressedSparseAttention(cfg)
@@ -226,8 +227,15 @@ class TestCSASelectedAttentionMatchesBlockMask(unittest.TestCase):
         idx_k = torch.randn(seqlen // 4, 4, device=device)
         idx_w = torch.randn(seqlen, 2, device=device)
         attn_sink = torch.randn(n_heads, device=device)
-        with self.assertRaises(ValueError):
-            csa(q, swa_k, cmp_k, idx_q, idx_k, idx_w, attn_sink)
+        expected = torch.zeros(1, n_heads, seqlen, head_dim, device=device)
+        with mock.patch(
+            "torchtitan.models.deepseek_v4.attention.gather_attn",
+            return_value=expected,
+        ) as gather:
+            actual = csa(q, swa_k, cmp_k, idx_q, idx_k, idx_w, attn_sink)
+
+        self.assertEqual(gather.call_args.kwargs["scale"], cfg.softmax_scale)
+        torch.testing.assert_close(actual, expected.squeeze(0).transpose(0, 1))
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ class TestDeepSeekV4AttentionCache(unittest.TestCase):
     def _make_model(self):
         # Only mask construction and parameter-free inner attention are used.
         with torch.device("meta"):
-            model = model_registry("debugmodel", seq_len=512).model.build()
+            model = model_registry("debugmodel", seq_len=512).build()
         return model
 
     def _assert_outputs_and_grads_match(self, inner, cached_mask, seqlen):
